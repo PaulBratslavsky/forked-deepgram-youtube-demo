@@ -1,11 +1,12 @@
 import { createClient } from "@supabase/supabase-js";
-import { Deepgram } from "@deepgram/sdk";
+import { createClient as deepgramClient } from "@deepgram/sdk";
+
 import { Features } from "@/context/transcription";
 import { NextResponse } from "next/server";
-import { ReadStreamSource } from "@deepgram/sdk/dist/types";
 import fs from "fs";
 import urlParser from "@/util/urlParser";
-import ytdl from "ytdl-core";
+import ytdl from "@distube/ytdl-core";
+
 import featureMap from "@/util/featureMap";
 
 const supabase = createClient(
@@ -13,10 +14,9 @@ const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? ""
 );
 
-const dg = new Deepgram(
-  process.env.DEEPGRAM_API_KEY as string,
-  "api.beta.deepgram.com"
-);
+  const dg = deepgramClient(process.env.DEEPGRAM_API_KEY as string);
+
+const DOWNLOAD_TIMEOUT = 30000; // 30 seconds timeout
 
 export async function POST(request: Request) {
   const body: {
@@ -34,53 +34,76 @@ export async function POST(request: Request) {
       filter: "audioonly",
       quality: "highestaudio",
     });
+    
+    const timeoutId = setTimeout(() => {
+      stream.end();
+      fetch.destroy();
+      reject(new Error('Download timeout exceeded'));
+    }, DOWNLOAD_TIMEOUT);
+    
+    fetch.on('error', (error) => {
+      clearTimeout(timeoutId);
+      stream.end();
+      reject(new Error(`Download failed: ${error.message}`));
+    });
+
     fetch.pipe(stream);
-    fetch.on("end", async () => {
-      const dgSource: ReadStreamSource = {
-        stream: fs.createReadStream(mp3FilePath),
-        mimetype: "audio/mp3",
-      };
-
-      const map = featureMap(features.filter((f) => f.value !== false));
-      map.push({ model: "nova" });
-      map.push({ llm: 1 });
-      map.push({ tag: "deeptube-demo" });
-      map.push({ utt_split: 1.2 });
-
-      const dgFeatures = Object.assign({}, ...map);
-
+    
+    stream.on('finish', async () => {
+      clearTimeout(timeoutId);
       try {
-        const transcript: {
-          results?: any;
-          metadata?: any;
-          err_msg?: string;
-        } = await dg.transcription.preRecorded(dgSource, dgFeatures);
+        const map = featureMap(features.filter((f) => f.value !== false));
+        const defaultFeatures = [
+          { model: "nova-2" },
+          { llm: 1 },
+          { tag: "deeptube-demo" },
+          { utt_split: 1.2 }
+        ] as const;
+        map.push(...defaultFeatures);
 
-        if (transcript.err_msg) throw new Error(transcript.err_msg);
+        const { result, error } = await dg.listen.prerecorded.transcribeFile(
+          fs.createReadStream(mp3FilePath),
+          {
+            model: "nova-2",
+            ...Object.fromEntries(map.map(item => Object.entries(item)[0]))
+          }
+        );
+        
+        if (error) throw new Error(error.message);
 
         const data = {
           source,
           features,
-          ...transcript,
+          ...result,
         };
 
-        const { error } = await supabase.from("transcriptions").insert({
+        const { error: dbError } = await supabase.from("transcriptions").insert({
           url: source.url,
-          request_id: transcript.metadata.request_id,
+          request_id: result.metadata.request_id,
           data,
           features,
         });
 
-        if (error) throw new Error(error.message);
+        if (dbError) throw new Error(dbError.message);
 
-        resolve({ request_id: transcript.metadata.request_id });
+        resolve({ request_id: result.metadata.request_id });
       } catch (error) {
-        if (error instanceof Error) {
-          reject(error.message);
-        }
+        reject(error instanceof Error ? error.message : 'An unknown error occurred');
+      } finally {
+        fs.unlink(mp3FilePath, (err) => {
+          if (err) console.error('Error cleaning up temporary file:', err);
+        });
       }
     });
   });
 
-  return NextResponse.json(await getVideo);
+  try {
+    const result = await getVideo;
+    return NextResponse.json(result);
+  } catch (error) {
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : 'An unknown error occurred' },
+      { status: 500 }
+    );
+  }
 }
